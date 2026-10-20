@@ -1,0 +1,15 @@
+.env*
+!.env.example
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+*.db
+*.sqlite*
+media/*
+!media/.gitkeep
+proxies*.txt
+!proxies.example.txt
+.DS_Store

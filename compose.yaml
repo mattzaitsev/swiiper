@@ -1,0 +1,77 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: swiiper_api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: postgresql://swiiper_user:swiiper_pass@db:5432/swiiper_db
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_DIR: /media
+    volumes:
+      - ./media:/media:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  scraper_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: swiiper_worker
+    # Denied/auth-failed requests stop for diagnosis rather than restart forever.
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://swiiper_user:swiiper_pass@db:5432/swiiper_db
+      REDIS_URL: redis://redis:6379/0
+      PYTHONUNBUFFERED: "1"
+      PROXY_URL: ${PROXY_URL:-http://p.webshare.io:80}
+      PROXY_AUTH_MODE: ${PROXY_AUTH_MODE:-credentials}
+      PROXY_USERNAME: ${PROXY_USERNAME:-}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+      PROXY_FORCE_CLOSE: ${PROXY_FORCE_CLOSE:-0}
+      REDDIT_USER_AGENT: ${REDDIT_USER_AGENT:-swiiper-sandbox/1.0}
+      SUBREDDITS: ${SUBREDDITS:-pics,aww,gaming}
+      POLL_SECONDS: ${POLL_SECONDS:-300}
+      PROXY_LIST_FILE: /run/secrets/webshare_proxies
+    secrets:
+      - webshare_proxies
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    container_name: swiiper_db
+    environment:
+      POSTGRES_USER: swiiper_user
+      POSTGRES_PASSWORD: swiiper_pass
+      POSTGRES_DB: swiiper_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swiiper_user -d swiiper_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: swiiper_cache
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+
+secrets:
+  webshare_proxies:
+    file: ${PROXY_LIST_PATH:-./proxies.example.txt}
