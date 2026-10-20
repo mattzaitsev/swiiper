@@ -87,9 +87,9 @@
         const copy = el('div', 'search-option-copy');
         const name = el('span', 'search-option-name');
         name.append(highlight(row.displayName || row.subreddit, query));
-        const count = el('span', 'search-option-members', Number.isInteger(row.members)
-          ? `${countFormat.format(row.members)} members` : 'Member count unavailable');
-        if (Number.isInteger(row.members)) count.title = `${row.members.toLocaleString('en')} members · Directory-reported total`;
+        if (row.nsfw) name.append(el('span', 'nsfw-badge', '18+'));
+        const count = el('span', 'search-option-members', Number.isInteger(row.posts)
+          ? `${countFormat.format(row.posts)} posts loaded` : 'Popular community · not loaded yet');
         copy.append(name, count);
         const arrow = el('span', 'search-option-arrow', '↗');
         arrow.setAttribute('aria-hidden', 'true');
@@ -117,7 +117,8 @@
         render([], query, 'Use letters, numbers, and underscores.');
         return;
       }
-      const cached = cache.get(query);
+      const key = (showNsfw ? 'nsfw:' : '') + query;
+      const cached = cache.get(key);
       if (cached && cached.expires > Date.now()) {
         render(cached.rows, query, cached.message);
         return;
@@ -127,20 +128,23 @@
       timer = setTimeout(async () => {
         abort = new AbortController();
         try {
-          const response = await fetch('/api/v1/subreddits/suggest?' + new URLSearchParams({q:query}), {signal:abort.signal});
+          const params = new URLSearchParams({q:query});
+          if (showNsfw) params.set('nsfw', '1');
+          const response = await fetch('/api/v1/subreddits/suggest?' + params, {signal:abort.signal});
           if (!response.ok) throw new Error('Search unavailable');
           const data = await response.json();
           if (token !== sequence || document.activeElement !== input) return;
           if (!Array.isArray(data.subreddits)) throw new Error('Invalid search response');
-          const message = !data.available ? 'Live search is unavailable. Showing loaded communities.'
-            : !data.subreddits.length ? 'No matching communities. Try another name or press Search.' : '';
-          cache.set(query, {rows:data.subreddits, message, expires:Date.now() + (data.available ? 300000 : 15000)});
+          const message = !data.available ? 'Loaded communities are unavailable. Showing popular ones.'
+            : !data.subreddits.length ? 'No matching communities. Press Search to open it by exact name.' : '';
+          // Loaded communities change as the worker runs, so results are kept briefly.
+          cache.set(key, {rows:data.subreddits, message, expires:Date.now() + (data.available ? 30000 : 10000)});
           if (cache.size > 80) cache.delete(cache.keys().next().value);
           render(data.subreddits, query, message);
         } catch (error) {
           if (error.name === 'AbortError' || token !== sequence || document.activeElement !== input) return;
-          const local = communities.filter(row => row.subreddit.includes(query)).map(row => ({...row, members:null}));
-          render(local, query, 'Search is unavailable. You can still search by exact name.');
+          const local = communities.filter(row => row.subreddit.includes(query));
+          render(local, query, 'Search is unavailable. You can still open a community by exact name.');
         }
       }, 180);
     }

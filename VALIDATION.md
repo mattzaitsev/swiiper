@@ -1,5 +1,7 @@
 # Executed validation
 
+> The September 2026 entries below describe the earlier Webshare proxy setup, kept for history. The worker now uses Oxylabs (see the October 20 changeover at the end).
+
 Validated on the user's Windows/Docker sandbox on September 21, 2026 (September 22 UTC).
 
 - Original malformed destination reproduced **502 at proxy CONNECT**. With the same original proxy credential, HTTP Webshare, HTTPS Webshare and the corrected Reddit Atom URL each returned **200**.
@@ -17,3 +19,20 @@ Validated on the user's Windows/Docker sandbox on September 21, 2026 (September 
 Scope: the proxy control test and successful feed ingestion validate the tested connections, not all 20,000 export entries or every future request. The worker collects RSS metadata and does not download/transcode video. MP4 byte-range serving is available for local files supplied in `media/`.
 
 Repository publication check, October 20, 2026: all 24 backend tests passed in a disposable container; frontend JavaScript syntax and Docker Compose configuration validation passed. Real credentials and local media were excluded from the initial commit.
+
+## Oxylabs changeover, October 20, 2026
+
+- The Webshare gateway, export-file pool and IP-check endpoints were replaced with an Oxylabs configuration in `app/proxy.py`. It covers residential, mobile, datacenter, ISP and the dedicated products, with the documented entry points and username formats. Country, US state, sticky session and endpoint override are supported.
+- Proxy authentication now uses a `Proxy-Authorization` header built with `aiohttp.encode_basic_auth`, replacing the deprecated `BasicAuth`. The suite no longer emits the deprecation warnings.
+- `python -m pytest -q`: **42 passed** in a disposable `python:3.12-slim` container. This includes a local proxy that captures the CONNECT request's `Proxy-Authorization` header, plus username formats for every product, settings validation, and credential-file handling.
+- Docker Compose configuration validation passed, and `node --check` passed on both frontend scripts.
+- Not yet run: a live `--diagnose` against Oxylabs. It needs the account's proxy-user credentials in `.env`.
+
+## Media, 18+ and search fixes, October 20, 2026
+
+- `python -m pytest -q`: **65 passed** in a disposable `python:3.12-slim` container. New tests cover image ranking on Reddit-shaped RSS entries (original over preview, 140 px previews dropped, `-v0-` preview names, external previews, MP4, hosted video, text posts), the stored-image upgrade, score and MP4 enrichment, the 18+ check and its overrides, the age gate on both feed routes, For you exclusion, local suggestions, and `Cache-Control` on UI files.
+- Stored data before the fix: 248 image posts pointed at `preview.redd.it` copies (58 at 140 px, 8 at 320 px, 182 at 640 px) and 1 at an `i.redd.it` original. `--upgrade-images` repointed all 248 to `i.redd.it` originals. Of 40 sampled derived originals, 37 returned 200 and 3 returned 404 (removed uploads); the UI falls back to the preview for those.
+- Schema upgrade on the existing volume: the `upvote_score` default of 0 was dropped and all 390 placeholder zeros became `NULL`; `media_type` gained `video_mp4`.
+- Browser: the Home stream showed a 4000×2667 original; the community viewer showed a 3024×4032 original filling its stage instead of rendering at natural size; grid cards used 640 px previews. For you returned only SFW communities, an 18+ community returned the age gate, and dismissing the dialog kept 18+ communities hidden. Explore suggestions were served locally.
+- UI files are now sent with `Cache-Control: no-cache`. Without it, the browser kept using a stale stylesheet after the rebuild.
+- `node --check` passed on both frontend scripts; Docker Compose configuration validation passed.

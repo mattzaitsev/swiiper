@@ -1,0 +1,4 @@
+# Optional Oxylabs proxy credentials file, mounted into the worker as a Docker secret.
+# Put your real "username:password" in a copy that Git ignores (e.g. oxylabs-proxy.txt) and set
+# OXYLABS_PROXY_CREDENTIALS_PATH=./oxylabs-proxy.txt in .env. This placeholder holds no credentials,
+# so the worker falls back to OXYLABS_PROXY_USERNAME / OXYLABS_PROXY_PASSWORD.

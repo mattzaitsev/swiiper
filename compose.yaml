@@ -11,6 +11,9 @@ services:
       DATABASE_URL: postgresql://swiiper_user:swiiper_pass@db:5432/swiiper_db
       REDIS_URL: redis://redis:6379/0
       MEDIA_DIR: /media
+      # Corrections to the name-based 18+ check (comma-separated subreddits).
+      NSFW_SUBREDDITS: ${NSFW_SUBREDDITS:-}
+      SFW_SUBREDDITS: ${SFW_SUBREDDITS:-}
     volumes:
       - ./media:/media:ro
     depends_on:
@@ -30,19 +33,25 @@ services:
       DATABASE_URL: postgresql://swiiper_user:swiiper_pass@db:5432/swiiper_db
       REDIS_URL: redis://redis:6379/0
       PYTHONUNBUFFERED: "1"
-      PROXY_URL: ${PROXY_URL:-http://p.webshare.io:80}
-      PROXY_AUTH_MODE: ${PROXY_AUTH_MODE:-credentials}
-      PROXY_USERNAME: ${PROXY_USERNAME:-}
-      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+      # Oxylabs proxy. Credentials: OXYLABS_PROXY_USERNAME/PASSWORD here, or the secret file below.
+      OXYLABS_PROXY_PRODUCT: ${OXYLABS_PROXY_PRODUCT:-residential}
+      OXYLABS_PROXY_USERNAME: ${OXYLABS_PROXY_USERNAME:-}
+      OXYLABS_PROXY_PASSWORD: ${OXYLABS_PROXY_PASSWORD:-}
+      OXYLABS_PROXY_COUNTRY: ${OXYLABS_PROXY_COUNTRY:-US}
+      OXYLABS_PROXY_STATE: ${OXYLABS_PROXY_STATE:-}
+      OXYLABS_PROXY_SESSION_MINUTES: ${OXYLABS_PROXY_SESSION_MINUTES:-0}
+      OXYLABS_PROXY_ENDPOINT: ${OXYLABS_PROXY_ENDPOINT:-}
       PROXY_FORCE_CLOSE: ${PROXY_FORCE_CLOSE:-0}
       REDDIT_USER_AGENT: ${REDDIT_USER_AGENT:-swiiper-sandbox/1.0}
       SUBREDDITS: ${SUBREDDITS:-pics,aww,gaming}
       POLL_SECONDS: ${POLL_SECONDS:-300}
-      PROXY_LIST_FILE: /run/secrets/webshare_proxies
+      OXYLABS_PROXY_CREDENTIALS_FILE: /run/secrets/oxylabs_proxy
     secrets:
-      - webshare_proxies
+      - oxylabs_proxy
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   db:
@@ -73,5 +82,6 @@ volumes:
   postgres_data:
 
 secrets:
-  webshare_proxies:
-    file: ${PROXY_LIST_PATH:-./proxies.example.txt}
+  oxylabs_proxy:
+    # Optional "username:password" file kept outside Git. Takes priority over the env credentials.
+    file: ${OXYLABS_PROXY_CREDENTIALS_PATH:-./oxylabs-proxy.example.txt}

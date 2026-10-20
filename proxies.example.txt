@@ -1,2 +1,0 @@
-# Optional proxy export: host:port:username:password, one entry per line.
-# Keep real credentials in a separate ignored file and set PROXY_LIST_PATH in .env.

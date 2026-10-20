@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-import aiohttp
 import asyncpg
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
@@ -19,12 +18,15 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from .db import open_pool
-from .directory import SubredditDirectory
+from .directory import suggest
+from .names import is_nsfw, normalize_feed
 
 log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
 MEDIA_ROOT = Path(os.getenv('MEDIA_DIR', str(ROOT / 'media'))).resolve()
 MAX_OFFSET = 1_000_000
+VIDEO_CATEGORIES = ('video_hls', 'video_mp4')
+MEDIA_TYPES = {'direct_image': 'image', 'video_hls': 'video', 'video_mp4': 'video'}
 
 
 class MediaFileResponse(FileResponse):
@@ -37,13 +39,6 @@ class MediaFileResponse(FileResponse):
                     for key, value in message['headers']]
             await send(message)
         await super().__call__(scope, receive, send_with_range_unit)
-
-
-def normalize_feed(value: str) -> str:
-    value = value.strip().removeprefix('/r/').removeprefix('r/').rstrip('/').lower()
-    if not re.fullmatch(r'[a-z0-9_]{1,50}', value):
-        raise ValueError('Use one subreddit name containing letters, numbers or underscores')
-    return value
 
 
 def encode_cursor(offset: int) -> str:
@@ -74,15 +69,9 @@ async def lifespan(app):
     app.state.cache = Redis.from_url(os.getenv('REDIS_URL', 'redis://redis:6379/0'),
                                     decode_responses=True, socket_timeout=1,
                                     socket_connect_timeout=1)
-    app.state.directory_session = aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=4, ttl_dns_cache=300),
-        timeout=aiohttp.ClientTimeout(total=6, connect=3),
-        headers={'User-Agent': 'swiiper-sandbox/1.0', 'Accept': 'application/json'})
-    app.state.directory = SubredditDirectory(app.state.directory_session)
     try:
         yield
     finally:
-        await app.state.directory_session.close()
         await app.state.cache.aclose()
         await app.state.pool.close()
 
@@ -92,6 +81,16 @@ app.mount('/assets', StaticFiles(directory=ROOT / 'web', check_dir=False), name=
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False,
                    allow_methods=['GET', 'HEAD'], allow_headers=['Range'],
                    expose_headers=['Content-Range', 'Accept-Ranges', 'Content-Length'])
+
+
+@app.middleware('http')
+async def revalidate_ui(request: Request, call_next):
+    response = await call_next(request)
+    # The UI's file names aren't versioned, so browsers must check for updates instead of
+    # reusing a heuristically cached copy (304 when unchanged).
+    if request.url.path == '/' or request.url.path.startswith('/assets/'):
+        response.headers.setdefault('Cache-Control', 'no-cache')
+    return response
 
 
 @app.get('/', include_in_schema=False)
@@ -113,13 +112,22 @@ async def health(request: Request):
     return {'database': 'ok', 'cache': cache}
 
 
-async def feed_response(request: Request, feed: str, after: str | None, limit: int, kind: str = 'all'):
+def age_gate(name):
+    return HTTPException(403, {'code': 'age_gate',
+                               'message': f'r/{name} is marked 18+. Confirm your age to view it.'})
+
+
+async def feed_response(request: Request, feed: str, after: str | None, limit: int,
+                        kind: str = 'all', nsfw: bool = False):
     try:
         feed = normalize_feed(feed)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
+    if feed != 'all' and is_nsfw(feed) and not nsfw:
+        raise age_gate(feed)
     offset = decode_cursor(after)
-    key = f'feed:v2:{feed}:{kind}:{offset}:{limit}'
+    # The worker clears `feed:v3:{feed}:*` after ingesting, so the feed name stays third.
+    key = f'feed:v3:{feed}:{kind}:{int(nsfw)}:{offset}:{limit}'
     cache = request.app.state.cache
     try:
         cached = await cache.get(key)
@@ -127,15 +135,22 @@ async def feed_response(request: Request, feed: str, after: str | None, limit: i
             return json.loads(cached)
     except (RedisError, ValueError):
         log.warning('Feed cache unavailable or invalid; querying database')
+    pool = request.app.state.pool
     try:
-        rows = await request.app.state.pool.fetch(
+        hidden = []
+        if feed == 'all' and not nsfw:
+            # "For you" leaves out 18+ communities until the viewer opts in.
+            names = await pool.fetch('SELECT DISTINCT subreddit FROM reddit_media_posts')
+            hidden = [row['subreddit'] for row in names if is_nsfw(row['subreddit'])]
+        rows = await pool.fetch(
             '''SELECT db_primary_id, title, subreddit, upvote_score, media_category,
                       clean_delivery_url, thumbnail_url, source_origin_url, created_utc
                FROM reddit_media_posts WHERE ($1 = 'all' OR subreddit = $1)
-                 AND ($4 = 'all' OR ($4 = 'video' AND media_category = 'video_hls')
+                 AND ($4 = 'all' OR ($4 = 'video' AND media_category::text = ANY($6::text[]))
                       OR ($4 = 'image' AND media_category = 'direct_image'))
+                 AND NOT (subreddit = ANY($5::text[]))
                ORDER BY created_utc DESC, db_primary_id DESC LIMIT $2 OFFSET $3''',
-            feed, limit + 1, offset, kind)
+            feed, limit + 1, offset, kind, hidden, list(VIDEO_CATEGORIES))
     except (asyncpg.PostgresError, OSError, TimeoutError):
         raise HTTPException(503, 'Feed database unavailable') from None
     posts = []
@@ -143,8 +158,9 @@ async def feed_response(request: Request, feed: str, after: str | None, limit: i
         posts.append({
             'id': row['db_primary_id'].removeprefix('t3_'),
             'title': row['title'], 'subreddit': row['subreddit'],
-            'upvotes': row['upvote_score'],
-            'mediaType': {'direct_image': 'image', 'video_hls': 'video'}.get(row['media_category'], 'link'),
+            'upvotes': row['upvote_score'],  # None when unknown: RSS feeds carry no scores
+            'nsfw': is_nsfw(row['subreddit']),
+            'mediaType': MEDIA_TYPES.get(row['media_category'], 'link'),
             'mediaUrl': row['clean_delivery_url'],
             'thumbnail': row['thumbnail_url'],
             'sourceUrl': row['source_origin_url'],
@@ -168,17 +184,17 @@ async def feed_response(request: Request, feed: str, after: str | None, limit: i
 @app.get('/api/v1/feed')
 async def legacy_feed(request: Request, subreddit: str = 'pics', after: str | None = None,
                       cursors: str | None = None, limit: int = Query(25, ge=1, le=50),
-                      kind: Literal['all', 'image', 'video'] = 'all'):
-    return await feed_response(request, subreddit, select_cursor(after, cursors), limit, kind)
+                      kind: Literal['all', 'image', 'video'] = 'all', nsfw: bool = False):
+    return await feed_response(request, subreddit, select_cursor(after, cursors), limit, kind, nsfw)
 
 
 @app.get('/api/v1/subreddits')
-async def communities(request: Request, q: str = Query('', max_length=50)):
+async def communities(request: Request, q: str = Query('', max_length=50), nsfw: bool = False):
     # strpos treats user input literally (including underscores), unlike LIKE.
     try:
         rows = await request.app.state.pool.fetch('''
             SELECT subreddit, count(*) AS posts,
-                   count(*) FILTER (WHERE media_category='video_hls') AS videos,
+                   count(*) FILTER (WHERE media_category IN ('video_hls', 'video_mp4')) AS videos,
                    (array_agg(COALESCE(thumbnail_url,
                        CASE WHEN media_category='direct_image' THEN clean_delivery_url END)
                        ORDER BY created_utc DESC)
@@ -188,29 +204,27 @@ async def communities(request: Request, q: str = Query('', max_length=50)):
         ''', q.strip().lower().removeprefix('r/'))
     except (asyncpg.PostgresError, OSError, TimeoutError):
         raise HTTPException(503, 'Communities unavailable') from None
-    return {'subreddits': [dict(row) for row in rows]}
+    found = [dict(row, nsfw=is_nsfw(row['subreddit'])) for row in rows]
+    return {'subreddits': [row for row in found if nsfw or not row['nsfw']]}
 
 
 @app.get('/api/v1/subreddits/suggest')
-async def suggest_communities(request: Request, q: str = Query('', max_length=54)):
+async def suggest_communities(request: Request, q: str = Query('', max_length=54), nsfw: bool = False):
     query = q.strip().lower().removeprefix('/r/').removeprefix('r/').rstrip('/')
     if not query:
-        return {'subreddits': [], 'source': 'directory', 'available': True}
+        return {'subreddits': [], 'source': 'local', 'available': True}
     if not re.fullmatch(r'[a-z0-9_]{1,50}', query):
         raise HTTPException(400, 'Use letters, numbers, and underscores')
     try:
-        rows = await request.app.state.directory.search(query)
-        return {'subreddits': rows, 'source': 'reddclips', 'available': True}
-    except (aiohttp.ClientError, TimeoutError, ValueError):
-        # A directory outage must not stop browsing communities already loaded.
-        try:
-            rows = await request.app.state.pool.fetch(
-                "SELECT DISTINCT subreddit FROM reddit_media_posts WHERE strpos(subreddit, $1)>0 ORDER BY subreddit LIMIT 12", query)
-        except (asyncpg.PostgresError, OSError, TimeoutError):
-            rows = []
-        return {'subreddits': [{'subreddit': row['subreddit'],
-                               'displayName': row['subreddit'], 'members': None} for row in rows],
-                'source': 'local', 'available': False}
+        rows = await request.app.state.pool.fetch(
+            '''SELECT subreddit, count(*) AS posts FROM reddit_media_posts WHERE strpos(subreddit, $1) > 0
+               GROUP BY subreddit ORDER BY count(*) DESC LIMIT 50''', query)
+        loaded, available = {row['subreddit']: row['posts'] for row in rows}, True
+    except (asyncpg.PostgresError, OSError, TimeoutError):
+        # Without the database, popular communities can still be suggested.
+        loaded, available = {}, False
+    return {'subreddits': suggest(query, loaded, include_nsfw=nsfw), 'source': 'local',
+            'available': available}
 
 
 @app.post('/api/v1/subreddits/{name}/refresh', status_code=202)
@@ -275,5 +289,5 @@ async def media(filename: str):
 @app.get('/{feed_name}')
 async def modern_feed(request: Request, feed_name: str, after: str | None = None,
                       cursors: str | None = None, limit: int = Query(25, ge=1, le=50),
-                      kind: Literal['all', 'image', 'video'] = 'all'):
-    return await feed_response(request, feed_name, select_cursor(after, cursors), limit, kind)
+                      kind: Literal['all', 'image', 'video'] = 'all', nsfw: bool = False):
+    return await feed_response(request, feed_name, select_cursor(after, cursors), limit, kind, nsfw)

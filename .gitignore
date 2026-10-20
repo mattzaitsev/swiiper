@@ -11,5 +11,6 @@ __pycache__/
 media/*
 !media/.gitkeep
 proxies*.txt
-!proxies.example.txt
+oxylabs-proxy*.txt
+!oxylabs-proxy.example.txt
 .DS_Store

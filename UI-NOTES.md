@@ -3,7 +3,7 @@
 Open `http://localhost:8000/`.
 
 - **Home:** a continuous, one-item viewport. Wheel, vertical swipe, arrow keys, and previous/next buttons switch the active post. More metadata loads automatically at page boundaries. Only the current photo or video is mounted; leaving a video destroys its HLS player, clears its source, and removes it. Lightweight post metadata remains in memory so Back can reload earlier media, without a growing scroll document. Videos autoplay muted with native playback/audio controls. There is no Home hero/banner.
-- **Search:** both the header and Explore fields have an attached live dropdown from the first character, matching-text highlights, directory-reported member counts, click selection, arrow-key/Enter selection, Escape/outside-click dismissal, and immediate narrowing while new results load.
+- **Search:** both the header and Explore fields have an attached live dropdown from the first character, matching-text highlights, post counts for loaded communities, click selection, arrow-key/Enter selection, Escape/outside-click dismissal, and immediate narrowing while new results load.
 - **Explore:** subreddit search at the top, quick picks, available community counts, and community cards. The previous large introductory headline is removed. Search matches loaded/suggested communities; an exact public subreddit name can also be opened and loaded on demand.
 - **Community pages:** paginated media grids with a refresh action. New community requests run in the background worker with visible queued/loading/ready/error states.
 - **Saved:** bookmarks persist in this browser using localStorage. No account is required.
@@ -44,8 +44,10 @@ Reviewed the public fullscreen-viewer logic on [Reddclips](https://reddclips.com
 
 ## Subreddit autocomplete
 
-`GET /api/v1/subreddits/suggest?q=f` returns up to 12 matching community names and member totals. The search adapter uses the public `https://api.reddclips.com/search` endpoint inspected in the reference site's frontend. Reddit's own autocomplete returned 403 both directly and through the configured proxy during validation. No proxy credentials are passed to the directory. This is an external service dependency, not a complete local subreddit index; counts are directory-reported and may lag Reddit.
+`GET /api/v1/subreddits/suggest?q=f` returns up to 12 matching communities: those already loaded (with their post counts) and a built-in list of popular, media-friendly subreddits. Exact and prefix matches rank first, then loaded communities, then popular ones. 18+ communities are left out unless the request passes `nsfw=1`. Member counts are not shown because they aren't known locally.
 
-The browser debounces input for 180 ms, cancels obsolete requests, ignores stale responses, and keeps a bounded five-minute cache. The backend also caches successful queries for five minutes, caps concurrent connections and response size, and briefly backs off after upstream failures. If the provider is unavailable, loaded local communities remain searchable and missing counts are labelled unavailable rather than replaced with post totals.
+Until October 20, 2026 this used the third-party `api.reddclips.com/search` endpoint; Reddit's own autocomplete returned 403 directly and through the proxy. The local directory removes that dependency. Any public subreddit can still be opened by its exact name.
 
-Validation: all 24 backend tests passed. Browser checks covered first-letter results, narrowing from `f` to `foo`, rapid typing through `g`/`gam`/`gaming`, real member-count display, mouse and keyboard selection, Escape dismissal, and successful community navigation from both search fields. JavaScript syntax and Docker build passed.
+The browser debounces input for 180 ms, cancels obsolete requests, ignores stale responses, and keeps results for 30 seconds, since loaded communities change as the worker runs. If the database is unavailable, popular communities are still suggested.
+
+Validation of the earlier Reddclips-backed version: all 24 backend tests passed. Browser checks covered first-letter results, narrowing from `f` to `foo`, rapid typing through `g`/`gam`/`gaming`, real member-count display, mouse and keyboard selection, Escape dismissal, and successful community navigation from both search fields. JavaScript syntax and Docker build passed.

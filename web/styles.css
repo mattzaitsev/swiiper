@@ -68,3 +68,16 @@ body.stream-page{overflow:hidden}
 .search-dropdown-hint{border-top:1px solid #303d26;padding:10px 15px;font-size:10px;color:#8b9c7d}
 @keyframes search-emerge{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 @media(max-width:580px){.search-options{max-height:45dvh}.search-option{padding:10px 12px;gap:10px}.search-option-name{font-size:12px}.search-avatar{width:31px;height:31px}.global-search input{font-size:12px}.search-dropdown-hint{font-size:9px}}
+/* Full-size images fill the viewer, scaled to fit rather than shown at their natural size. */
+.viewer-stage{grid-template:minmax(0,1fr)/minmax(0,1fr)}
+.viewer-stage img{width:100%;height:100%;object-fit:contain}
+/* 18+ communities: badge, Explore toggle and age confirmation. */
+.nsfw-badge{display:inline-block;margin-left:8px;padding:1px 5px;border:1px solid #c9784f;border-radius:4px;color:#f1a37c;font-size:9px;font-weight:700;letter-spacing:.4px;vertical-align:middle}
+.nsfw-toggle{margin-left:auto;display:inline-flex;align-items:center;gap:7px;cursor:pointer;color:#9fb08f;font-size:10px}
+.nsfw-toggle input{accent-color:var(--lime);width:14px;height:14px;margin:0}
+dialog.age-gate{width:min(420px,calc(100vw - 32px));height:fit-content;max-height:calc(100dvh - 32px);inset:0;margin:auto;padding:30px 28px 26px;border-radius:16px;border:1px solid #435435;background:#151c12;color:var(--text);box-shadow:0 30px 70px #000a}
+dialog.age-gate::backdrop{background:#000c;backdrop-filter:blur(6px)}
+.age-mark{display:inline-grid;place-items:center;width:46px;height:46px;border-radius:50%;background:#2c1d14;border:1px solid #c9784f;color:#f1a37c;font-weight:800;font-size:14px}
+.age-gate h2{font-family:'Manrope',sans-serif;font-size:22px;letter-spacing:-.5px;margin:16px 0 10px}
+.age-gate p{color:#a5b398;font-size:12px;line-height:1.7;margin:0 0 22px}
+.age-actions{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}

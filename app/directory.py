@@ -1,71 +1,51 @@
-"""Small, cached adapter for the public subreddit directory used by Reddclips."""
-import asyncio
-from collections import OrderedDict
-import re
-import time
+"""Local subreddit directory for search suggestions: loaded communities plus a curated list.
 
-import aiohttp
+No third-party directory is called. Member counts aren't known locally, so none are shown.
+"""
+from .names import is_nsfw
 
-DIRECTORY_URL = 'https://api.reddclips.com/search'
+# Popular, media-friendly communities, in display casing. Matching is case-insensitive.
+POPULAR = (
+    'pics', 'aww', 'gaming', 'EarthPorn', 'oddlysatisfying', 'space', 'funny', 'memes', 'videos',
+    'gifs', 'interestingasfuck', 'nextfuckinglevel', 'mildlyinteresting', 'Damnthatsinteresting',
+    'BeAmazed', 'NatureIsFuckingLit', 'AnimalsBeingDerps', 'AnimalsBeingBros', 'AnimalsBeingJerks',
+    'rarepuppers', 'cats', 'dogs', 'dogpictures', 'catpictures', 'Eyebleach', 'StartledCats', 'Blep',
+    'corgi', 'goldenretrievers', 'husky', 'Rabbits', 'Otters', 'redpandas', 'sneks', 'birding',
+    'wildlifephotography', 'FoodPorn', 'food', 'Cooking', 'Baking', 'Breadit', 'Pizza', 'Coffee',
+    'cocktails', 'CityPorn', 'VillagePorn', 'ArchitecturePorn', 'RoomPorn', 'CabinPorn',
+    'AbandonedPorn', 'spaceporn', 'SkyPorn', 'WaterPorn', 'winterporn', 'HistoryPorn', 'MapPorn',
+    'landscapephotography', 'photography', 'itookapicture', 'analog', 'astrophotography',
+    'wallpaper', 'wallpapers', 'Art', 'CozyPlaces', 'houseplants', 'gardening', 'succulents',
+    'Bonsai', 'woodworking', 'DIY', 'crafts', 'knitting', 'crochet', 'Pottery', '3Dprinting',
+    'travel', 'hiking', 'camping', 'climbing', 'surfing', 'skateboarding', 'snowboarding', 'cars',
+    'carporn', 'motorcycles', 'battlestations', 'pcmasterrace', 'buildapc', 'MechanicalKeyboards',
+    'unixporn', 'lego', 'Minecraft', 'leagueoflegends', 'GlobalOffensive', 'apexlegends',
+    'FortNiteBR', 'pokemon', 'nintendo', 'NintendoSwitch', 'PS5', 'xbox', 'Steam', 'Eldenring',
+    'skyrim', 'pcgaming', 'Games', 'sports', 'nba', 'nfl', 'soccer', 'formula1', 'hockey',
+    'baseball', 'MMA', 'Fitness', 'running', 'bicycling', 'movies', 'television', 'marvelstudios',
+    'StarWars', 'anime', 'manga', 'comics', 'books', 'Music', 'Guitar', 'science', 'Physics',
+    'dataisbeautiful', 'Futurology', 'technology', 'gadgets', 'ProgrammerHumor', 'wholesomememes',
+    'MadeMeSmile', 'HumansBeingBros', 'powerwashingporn',
+)
+_POPULAR_RANK = {name.lower(): rank for rank, name in enumerate(POPULAR)}
 
 
-def normalize_results(data, query):
-    if not isinstance(data, dict) or not isinstance(data.get('results'), list):
-        raise ValueError('Invalid directory response')
-    found = {}
-    for item in data['results']:
-        if not isinstance(item, dict):
+def suggest(query: str, loaded: dict[str, int], include_nsfw: bool = False, limit: int = 12):
+    """Rank communities whose name contains `query`.
+
+    `loaded` maps each subreddit already in the database to its post count. Exact and prefix
+    matches come first, then loaded communities (most posts first), then popular ones.
+    """
+    display = {name.lower(): name for name in POPULAR}
+    names = {name for name in loaded if query in name} | {name for name in display if query in name}
+    rows = []
+    for name in names:
+        nsfw = is_nsfw(name)
+        if nsfw and not include_nsfw:
             continue
-        name = item.get('name')
-        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_]{1,50}', name):
-            continue
-        name = name.lower()
-        if query not in name or name in found:
-            continue
-        count = item.get('subscribers')
-        display = item.get('displayName')
-        found[name] = {'subreddit': name,
-                       'displayName': display if isinstance(display, str) and display.lower() == name else name,
-                       'members': count if type(count) is int and count >= 0 else None}
-    return sorted(found.values(), key=lambda r: (
-        r['subreddit'] != query, not r['subreddit'].startswith(query),
-        -(r['members'] or 0), r['subreddit']))[:12]
-
-
-class SubredditDirectory:
-    def __init__(self, session):
-        self.session = session
-        self.cache = OrderedDict()
-        self.slots = asyncio.Semaphore(4)
-        self.retry_at = 0
-
-    async def search(self, query):
-        now = time.monotonic()
-        cached = self.cache.get(query)
-        if cached and cached[0] > now:
-            self.cache.move_to_end(query)
-            return cached[1]
-        if now < self.retry_at:
-            raise ValueError('Directory temporarily unavailable')
-        try:
-            async with asyncio.timeout(7):
-                async with self.slots:
-                    async with self.session.get(DIRECTORY_URL,
-                            params={'q': query, 'limit': 50}, allow_redirects=False) as response:
-                        if response.status != 200:
-                            raise ValueError('Directory temporarily unavailable')
-                        body = bytearray()
-                        async for chunk in response.content.iter_chunked(16384):
-                            body.extend(chunk)
-                            if len(body) > 512_000:
-                                raise ValueError('Directory response too large')
-                        import json
-                        rows = normalize_results(json.loads(body), query)
-        except (aiohttp.ClientError, TimeoutError, ValueError):
-            self.retry_at = time.monotonic() + 15
-            raise
-        self.cache[query] = (time.monotonic() + 300, rows)
-        self.cache.move_to_end(query)
-        while len(self.cache) > 256:
-            self.cache.popitem(last=False)
-        return rows
+        rows.append({'subreddit': name, 'displayName': display.get(name, name),
+                     'posts': loaded.get(name), 'popular': name in display, 'nsfw': nsfw})
+    rows.sort(key=lambda row: (row['subreddit'] != query, not row['subreddit'].startswith(query),
+                               row['posts'] is None, -(row['posts'] or 0),
+                               _POPULAR_RANK.get(row['subreddit'], len(POPULAR)), row['subreddit']))
+    return rows[:limit]
