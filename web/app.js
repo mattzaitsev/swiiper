@@ -11,6 +11,9 @@ const paths = {
   play:'<path d="m8 4 12 8-12 8z"/>',
   image:'<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m3 17 6-6 4 4 3-3 5 5"/>',
   close:'<path d="m6 6 12 12M6 18 18 6"/>',
+  external:'<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+  volume:'<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 9a4 4 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/>',
+  muted:'<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="m16 9.5 5 5m0-5-5 5"/>',
   refresh:'<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/>',
   check:'<path d="m5 12 4 4L19 6"/>',
 };
@@ -41,6 +44,7 @@ let streamWheelTimer=null;
 let streamGestureUntil=0;
 const streamPlayers=new Map();
 const imageLoaders=new Set();
+let focusExploreSearch=false;
 const scoreFormat=new Intl.NumberFormat('en',{notation:'compact',maximumFractionDigits:1});
 // 18+ communities stay hidden until the viewer confirms their age once in this browser.
 let showNsfw=false;
@@ -127,17 +131,39 @@ async function moveStream(direction){
     renderStreamWindow();
   }finally{if(token===epoch)streamNavigating=false;}
 }
+// Videos on Home use their own controls: tap to pause, a sound button and a thin progress bar,
+// so nothing covers the caption. Sound stays as the viewer last set it.
+let streamMuted=true;
+function setMuteButton(entry){
+  if(!entry.sound)return;
+  entry.sound.replaceChildren(icon(streamMuted?'muted':'volume'));
+  entry.sound.setAttribute('aria-label',streamMuted?'Unmute':'Mute');
+}
+function toggleStreamSound(entry){
+  streamMuted=!streamMuted;
+  if(entry.video){entry.video.muted=streamMuted;if(!streamMuted)entry.video.play().catch(()=>{});}
+  setMuteButton(entry);
+}
+function toggleStreamPlayback(entry){const target=entry?.video;if(!target)return;if(target.paused)target.play().catch(()=>{});else target.pause();}
 function mountStreamVideo(entry){
   if(entry.video){entry.video.play().catch(()=>{});return;}
   const target=el('video');entry.video=target;
-  target.controls=true;target.playsInline=true;target.loop=true;target.muted=true;
+  target.playsInline=true;target.loop=true;target.muted=streamMuted;
   target.preload='metadata';target.setAttribute('aria-label',entry.post.title);
   if(safeURL(entry.post.thumbnail))target.poster=safeURL(entry.post.thumbnail);
   entry.media.replaceChildren(target);
+  target.addEventListener('click',()=>toggleStreamPlayback(entry));
+  target.addEventListener('play',()=>entry.card.classList.remove('is-paused'));
+  target.addEventListener('pause',()=>entry.card.classList.add('is-paused'));
+  target.addEventListener('timeupdate',()=>{entry.bar.style.transform=`scaleX(${target.duration?target.currentTime/target.duration:0})`;});
   const source=safeURL(entry.post.mediaUrl);
-  const fail=()=>{if(entry.video!==target)return;entry.stop();entry.media.replaceChildren(external('Watch the original video ↗',entry.post.sourceUrl,'button secondary'));};
+  const fail=()=>{if(entry.video!==target)return;entry.stop();entry.progress.hidden=true;entry.card.classList.remove('is-paused');entry.media.replaceChildren(external('Watch the original video ↗',entry.post.sourceUrl,'button secondary'));};
   target.addEventListener('error',fail,{once:true});
-  const play=()=>{if(entry.video===target)target.play().catch(()=>{});};
+  const play=()=>{if(entry.video!==target)return;target.play().catch(()=>{
+    // Browsers block autoplay with sound until the page has been clicked; retry muted.
+    if(entry.video!==target||target.muted)return;
+    streamMuted=true;target.muted=true;setMuteButton(entry);target.play().catch(()=>{});
+  });};
   if(!source){fail();return;}
   if(/\.m3u8(?:$|\?)/i.test(source)&&window.Hls?.isSupported()){
     const player=new Hls({maxBufferLength:20});entry.hls=player;
@@ -146,18 +172,20 @@ function mountStreamVideo(entry){
     player.on(Hls.Events.ERROR,(_event,data)=>{if(data.fatal)fail();});
   }else{target.src=source;play();}
 }
+// One post fills the whole stage. Controls float over it; nothing frames it.
 function renderStreamCard(post,index){
   const card=el('article','stream-card');card.dataset.index=String(index);
+  card.setAttribute('aria-label',`Post ${index+1}: ${post.title}`);
+  // A blurred, dimmed copy fills the space a picture leaves when its shape differs from the screen's.
+  const fill=safeURL(post.thumbnail)||(post.mediaType==='image'?safeURL(post.mediaUrl):null);
+  if(fill){const backdrop=el('div','stream-backdrop');backdrop.style.backgroundImage=`url("${fill}")`;card.append(backdrop);}
   const media=el('div','stream-media');
   const url=safeURL(post.mediaUrl);
+  let entry=null;
   if(post.mediaType==='image'&&url){
     media.append(postImage(post,{full:true,onFail:()=>media.replaceChildren(external('Open original post ↗',post.sourceUrl,'button secondary'))}));
   }else if(post.mediaType==='video'){
-    const placeholder=el('div','stream-video-placeholder');
-    const poster=safeURL(post.thumbnail);
-    if(poster){const image=el('img');image.src=poster;image.alt=post.title;placeholder.append(image);}
-    const play=el('span','play-badge');play.append(icon('play'));placeholder.append(play);media.append(placeholder);
-    const entry={post,media,video:null,hls:null,stop(){
+    entry={post,card,media,video:null,hls:null,stop(){
       const player=this.hls;this.hls=null;player?.destroy();
       const old=this.video;this.video=null;
       if(old){old.pause();old.removeAttribute('src');old.load();old.remove();}
@@ -173,28 +201,34 @@ function renderStreamCard(post,index){
   const title=el('h2','',post.title);const meta=el('div','stream-meta');
   meta.append(el('span','',age(post.timestamp)));
   if(score(post))meta.append(el('span','',score(post)));
-  meta.append(external('Original ↗',post.sourceUrl));
   caption.append(sub);
   if(post.nsfw)caption.append(el('span','nsfw-badge','18+'));
   caption.append(title,meta);
-  const save=button('','round-button stream-save',()=>toggleSaved(post));save.dataset.saveId=post.id;save.append(icon('bookmark'));
-  card.append(media,caption,save);$('#feed-grid').append(card);
-  const navigation=el('nav','stream-navigation');
-  navigation.setAttribute('aria-label','Feed navigation');
+  const actions=el('div','stream-actions');
   const previous=button('','round-button',()=>moveStream(-1));
-  previous.setAttribute('aria-label','Previous post');previous.disabled=streamIndex===0;
-  previous.append(icon('up'));
+  previous.setAttribute('aria-label','Previous post');previous.disabled=streamIndex===0;previous.append(icon('up'));
   const next=button('','round-button',()=>moveStream(1));
-  next.setAttribute('aria-label','Next post');next.disabled=ended&&streamIndex===posts.length-1;
-  next.append(icon('down'));navigation.append(previous,next);card.append(navigation);
-  card.setAttribute('aria-label',`Post ${index+1}: ${post.title}`);
-  const entry=streamPlayers.get(card);
+  next.setAttribute('aria-label','Next post');next.disabled=ended&&streamIndex===posts.length-1;next.append(icon('down'));
+  const save=button('','round-button stream-save',()=>toggleSaved(post));save.dataset.saveId=post.id;save.append(icon('bookmark'));
+  const original=external('',post.sourceUrl,'round-button');original.setAttribute('aria-label','Open on Reddit');original.append(icon('external'));
+  actions.append(previous,next,save,original);
+  card.append(media,el('div','stream-shade'),caption,actions);
+  if(entry){
+    entry.sound=button('','round-button',()=>toggleStreamSound(entry));setMuteButton(entry);actions.prepend(entry.sound);
+    const paused=el('span','play-badge stream-paused');paused.append(icon('play'));
+    const progress=el('div','stream-progress');progress.setAttribute('aria-hidden','true');
+    const track=el('span');entry.bar=el('i');track.append(entry.bar);progress.append(track);entry.progress=progress;
+    progress.addEventListener('click',event=>{const target=entry.video;if(!target?.duration)return;const box=progress.getBoundingClientRect();target.currentTime=Math.min(Math.max((event.clientX-box.left)/box.width,0),1)*target.duration;});
+    // Shows a play badge until playback actually starts, e.g. when autoplay is blocked.
+    card.classList.add('is-paused');card.append(paused,progress);
+  }
+  $('#feed-grid').append(card);
   if(entry)mountStreamVideo(entry);
 }
 function renderSaved(){ended=true;posts=saved.filter(p=>kind==='all'||p.mediaType===kind);$('#feed-grid').replaceChildren();posts.forEach(renderCard);$('#feed-state').textContent='';$('#load-more').hidden=true;$('#start-swiping').disabled=!posts.length;if(!posts.length)emptyState('Keep the good ones close.','Tap the bookmark on a post and it will be waiting here. Saved posts stay in this browser.',button('Find something good','button primary',()=>navigate('#/home')));updateSaved();}
 function renderExplore(){const query=searchTerm.trim().toLowerCase().replace(/^\/?r\//,'').replace(/\/$/,'');const available=new Map(communities.map(c=>[c.subreddit,c]));const all=[...communities];for(const suggestion of suggestions)if(!available.has(suggestion.subreddit))all.push({...suggestion,posts:null,videos:null});const filtered=all.filter(c=>c.subreddit.toLowerCase().includes(query));$('#community-heading').textContent=query?`Communities matching “${query}”`:'Discover communities';const grid=$('#community-grid');grid.replaceChildren();for(const c of filtered){const a=el('a','community-card');a.href=communityLink(c.subreddit);const cover=el('div','community-cover');if(safeURL(c.cover)){const img=el('img');img.src=c.cover;img.alt='';img.loading='lazy';img.onerror=()=>img.remove();cover.append(img);}const avatar=el('span','community-avatar',c.subreddit[0].toUpperCase());const body=el('div','community-body');const description=suggestions.find(s=>s.subreddit===c.subreddit)?.description||'A new corner of the internet, waiting to be explored.';const name=el('h3','',`r/${c.subreddit}`);if(c.nsfw)name.append(el('span','nsfw-badge','18+'));body.append(name,el('p','',description));const bottom=el('div','community-bottom');bottom.append(el('span','',c.posts===null?'Ready to discover':`${c.posts} posts · ${c.videos} videos`),el('span','','↗'));body.append(bottom);a.append(cover,avatar,body);grid.append(a);}const action=$('#search-action');action.replaceChildren();action.hidden=!query||filtered.some(c=>c.subreddit===query);if(!action.hidden){const copy=el('div');copy.append(el('h3','',`Looking for r/${query}?`),el('p','','Load a public subreddit by its exact name. Private or unavailable communities cannot be loaded.'));const valid=/^[a-z0-9_]{1,50}$/.test(query);const b=button('Explore this community','button primary',()=>navigate(communityLink(query)));b.disabled=!valid;copy.append(!valid?el('p','','Use letters, numbers, and underscores.'):el('span'));action.append(copy,b);}if(!filtered.length&&!query)grid.append(el('p','subtle','Search for a subreddit to get started.'));}
 async function loadCommunity(name){const token=epoch;$('#feed-state').textContent=`Bringing r/${name} into your feed…`;$('#refresh-community').disabled=true;const buttons=$('#feed-grid').querySelectorAll('button');buttons.forEach(b=>b.disabled=true);try{await request(`/api/v1/subreddits/${encodeURIComponent(name)}/refresh`,{method:'POST'});let tries=0;async function poll(){if(token!==epoch)return;try{const result=await request(`/api/v1/subreddits/${encodeURIComponent(name)}/status`);if(token!==epoch)return;if(result.status==='ready'){$('#refresh-community').disabled=false;resetFeed();loadCommunities();showToast(`r/${name} is ready to explore.`);return;}if(result.status==='error')throw new Error(result.message||'This community could not be loaded.');if(++tries>=90)throw new Error('This is taking longer than expected. Try Refresh community in a moment.');$('#feed-state').textContent=result.status==='queued'?'Your community is next in line…':`Finding the latest from r/${name}…`;jobTimer=setTimeout(poll,2000);}catch(e){if(e.name!=='AbortError'&&token===epoch)loadError(e);}}await poll();}catch(e){if(e.name!=='AbortError'&&token===epoch)loadError(e);}function loadError(e){$('#refresh-community').disabled=false;$('#feed-state').textContent=e.message;buttons.forEach(b=>b.disabled=false);}}
-function renderRoute(){clearStream();closeViewer();epoch++;controller.abort();controller=new AbortController();clearTimeout(jobTimer);const route=location.hash.slice(1)||'/home';const [path,query='']=route.split('?');page=path==='/explore'?'explore':path==='/saved'?'saved':path.startsWith('/r/')?'community':'home';try{activeFeed=page==='community'?decodeURIComponent(path.slice(3)).toLowerCase():'all';}catch{activeFeed='all';page='home';}if(!/^[a-z0-9_]{1,50}$/.test(activeFeed)){navigate('#/explore');return;}kind='all';posts=[];after=null;loading=false;ended=false;searchTerm=new URLSearchParams(query).get('q')||'';document.querySelectorAll('[data-nav]').forEach(a=>{const active=a.dataset.nav===(page==='community'?'explore':page);a.classList.toggle('active',active);if(active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});document.querySelectorAll('[data-kind]').forEach(b=>b.classList.toggle('active',b.dataset.kind==='all'));$('#home-hero').hidden=true;document.body.classList.toggle('stream-page',page==='home');$('#explore-intro').hidden=page!=='explore';$('#explore-section').hidden=page!=='explore';$('#feed-section').hidden=page==='explore';$('#page-heading').hidden=!['saved','community'].includes(page);$('#refresh-community').hidden=page!=='community';$('#refresh-community').disabled=false;$('#breadcrumb').textContent=page==='home'?'Your daily discovery':page==='explore'?'Discover something new':page==='saved'?'Your personal collection':`Explore / r/${activeFeed}`;$('#page-eyebrow').textContent=page==='saved'?'THE GOOD ONES, KEPT CLOSE':'WELCOME TO YOUR NEXT RABBIT HOLE';$('#page-title').textContent=page==='saved'?'Saved for later.':`r/${activeFeed}`;$('#page-description').textContent=page==='saved'?'The posts you want to come back to.':'A fresh perspective from a community like no other.';$('#feed-title').textContent=page==='saved'?'Your collection':page==='community'?'From the community':'Your next good find';$('#feed-subtitle').textContent=page==='saved'?'Good taste. Great collection.':page==='community'?'Photos, videos, and everything worth a second look.':'A little bit of everything, fresh from your communities.';$('#explore-query').value=searchTerm;$('#feed-state').textContent='';document.title=page==='community'?`r/${activeFeed} — Swiiper`:`${page==='home'?'Follow your curiosity':page==='explore'?'Explore':'Saved'} — Swiiper`;window.scrollTo(0,0);renderChips();if(page==='explore')renderExplore();else if(page==='saved')renderSaved();else{skeletons();loadPage();}loadCommunities();updateSaved();}
+function renderRoute(){clearStream();closeViewer();epoch++;controller.abort();controller=new AbortController();clearTimeout(jobTimer);const route=location.hash.slice(1)||'/home';const [path,query='']=route.split('?');page=path==='/explore'?'explore':path==='/saved'?'saved':path.startsWith('/r/')?'community':'home';try{activeFeed=page==='community'?decodeURIComponent(path.slice(3)).toLowerCase():'all';}catch{activeFeed='all';page='home';}if(!/^[a-z0-9_]{1,50}$/.test(activeFeed)){navigate('#/explore');return;}kind='all';posts=[];after=null;loading=false;ended=false;searchTerm=new URLSearchParams(query).get('q')||'';document.querySelectorAll('[data-nav]').forEach(a=>{const active=a.dataset.nav===(page==='community'?'explore':page);a.classList.toggle('active',active);if(active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});document.querySelectorAll('[data-kind]').forEach(b=>b.classList.toggle('active',b.dataset.kind==='all'));$('#home-hero').hidden=true;document.body.classList.toggle('stream-page',page==='home');$('#explore-intro').hidden=page!=='explore';$('#explore-section').hidden=page!=='explore';$('#feed-section').hidden=page==='explore';$('#page-heading').hidden=!['saved','community'].includes(page);$('#refresh-community').hidden=page!=='community';$('#refresh-community').disabled=false;$('#breadcrumb').textContent=page==='home'?'Your daily discovery':page==='explore'?'Discover something new':page==='saved'?'Your personal collection':`Explore / r/${activeFeed}`;$('#page-eyebrow').textContent=page==='saved'?'THE GOOD ONES, KEPT CLOSE':'WELCOME TO YOUR NEXT RABBIT HOLE';$('#page-title').textContent=page==='saved'?'Saved for later.':`r/${activeFeed}`;$('#page-description').textContent=page==='saved'?'The posts you want to come back to.':'A fresh perspective from a community like no other.';$('#feed-title').textContent=page==='saved'?'Your collection':page==='community'?'From the community':'Your next good find';$('#feed-subtitle').textContent=page==='saved'?'Good taste. Great collection.':page==='community'?'Photos, videos, and everything worth a second look.':'A little bit of everything, fresh from your communities.';$('#explore-query').value=searchTerm;$('#feed-state').textContent='';document.title=page==='community'?`r/${activeFeed} — Swiiper`:`${page==='home'?'Follow your curiosity':page==='explore'?'Explore':'Saved'} — Swiiper`;window.scrollTo(0,0);renderChips();if(page==='explore')renderExplore();else if(page==='saved')renderSaved();else{skeletons();loadPage();}loadCommunities();updateSaved();if(page==='explore'&&focusExploreSearch){focusExploreSearch=false;$('#explore-query').focus();}}
 function stopVideo(){viewerSequence++;cancelImageLoads();if(video){video.pause();video.removeAttribute('src');video.load();video=null;}if(hls){hls.destroy();hls=null;}}
 function closeViewer(){const dialog=$('#viewer');if(!dialog.open)return;stopVideo();dialog.close();document.body.style.overflow='';if(page==='saved')renderSaved();lastTrigger?.focus({preventScroll:true});}
 function openViewer(index,trigger){if(!posts[index])return;lastTrigger=trigger||lastTrigger;viewerIndex=index;if(!$('#viewer').open){$('#viewer').showModal();document.body.style.overflow='hidden';}renderViewer();}
@@ -209,7 +243,7 @@ $('#load-more').addEventListener('click',loadPage);$('#refresh-community').addEv
 $('#start-swiping').addEventListener('click',e=>openViewer(0,e.currentTarget));$('#close-viewer').addEventListener('click',closeViewer);$('#viewer-brand').addEventListener('click',closeViewer);$('#viewer-community').addEventListener('click',closeViewer);
 $('#viewer').addEventListener('cancel',e=>{e.preventDefault();closeViewer();});$('#next-post').addEventListener('click',()=>nextPost(1));$('#previous-post').addEventListener('click',()=>nextPost(-1));
 let touchStart=null;$('#viewer-stage').addEventListener('touchstart',e=>{if(!e.target.closest('video'))touchStart=e.touches[0].clientY;},{passive:true});$('#viewer-stage').addEventListener('touchend',e=>{if(touchStart!==null){const delta=touchStart-e.changedTouches[0].clientY;if(Math.abs(delta)>65)nextPost(delta>0?1:-1);}touchStart=null;},{passive:true});
-document.addEventListener('keydown',e=>{if(e.target.matches('input,textarea'))return;if($('#viewer').open){if(e.key==='ArrowDown'){e.preventDefault();nextPost(1);}if(e.key==='ArrowUp'){e.preventDefault();nextPost(-1);}}else if(e.key==='/'){e.preventDefault();$('#global-query').focus();}});
+document.addEventListener('keydown',e=>{if(e.target.matches('input,textarea'))return;if($('#viewer').open){if(e.key==='ArrowDown'){e.preventDefault();nextPost(1);}if(e.key==='ArrowUp'){e.preventDefault();nextPost(-1);}}else if(e.key==='/'){e.preventDefault();if(page==='home'){focusExploreSearch=true;navigate('#/explore');}else $('#global-query').focus();}});
 // A wheel/swipe changes one item; it does not move through a growing document.
 $('#feed-grid').addEventListener('wheel',event=>{
   if(page!=='home'||event.ctrlKey||Math.abs(event.deltaX)>Math.abs(event.deltaY))return;
@@ -229,10 +263,8 @@ $('#feed-grid').addEventListener('wheel',event=>{
 },{passive:false});
 let feedTouch=null;
 $('#feed-grid').addEventListener('touchstart',event=>{
-  if(page!=='home'||event.touches.length!==1||event.target.closest('button,a,input'))return;
+  if(page!=='home'||event.touches.length!==1||event.target.closest('button,a,input,.stream-progress'))return;
   const touch=event.touches[0];
-  // Keep native video seeking/volume controls usable.
-  if(event.target.tagName==='VIDEO'&&touch.clientY>event.target.getBoundingClientRect().bottom-55)return;
   feedTouch={x:touch.clientX,y:touch.clientY};
 },{passive:true});
 $('#feed-grid').addEventListener('touchend',event=>{
@@ -246,6 +278,10 @@ document.addEventListener('keydown',event=>{
   if(page!=='home'||$('#viewer').open||event.target.closest('input,textarea,select,video'))return;
   if(['ArrowDown','PageDown'].includes(event.key)){event.preventDefault();moveStream(1);}
   if(['ArrowUp','PageUp'].includes(event.key)){event.preventDefault();moveStream(-1);}
+  const entry=streamPlayers.values().next().value;
+  if(!entry||event.target.closest('button,a'))return;
+  if([' ','k'].includes(event.key)){event.preventDefault();toggleStreamPlayback(entry);}
+  if(event.key==='m'){event.preventDefault();toggleStreamSound(entry);}
 });
 function openAgeGate(){const gate=$('#age-gate');gate.returnValue='';if(!gate.open)gate.showModal();}
 function setNsfw(on){showNsfw=on;try{if(on)localStorage.setItem('swiiper:nsfw','1');else localStorage.removeItem('swiiper:nsfw');}catch{}$('#nsfw-toggle').checked=on;if(page==='explore')loadCommunities();else renderRoute();showToast(on?'18+ communities are now shown.':'18+ communities are hidden.');}
