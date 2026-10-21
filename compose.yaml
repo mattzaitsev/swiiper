@@ -33,7 +33,10 @@ services:
       DATABASE_URL: postgresql://swiiper_user:swiiper_pass@db:5432/swiiper_db
       REDIS_URL: redis://redis:6379/0
       PYTHONUNBUFFERED: "1"
-      # Oxylabs proxy. Credentials: OXYLABS_PROXY_USERNAME/PASSWORD here, or the secret file below.
+      # Oxylabs Web API key: the default. Taken from your environment or .env.
+      OXYLABS_WEB_API_KEY: ${OXYLABS_WEB_API_KEY:-}
+      # Oxylabs proxy, used only without a Web API key. Credentials: OXYLABS_PROXY_USERNAME/PASSWORD
+      # here, or the secret file below.
       OXYLABS_PROXY_PRODUCT: ${OXYLABS_PROXY_PRODUCT:-residential}
       OXYLABS_PROXY_USERNAME: ${OXYLABS_PROXY_USERNAME:-}
       OXYLABS_PROXY_PASSWORD: ${OXYLABS_PROXY_PASSWORD:-}

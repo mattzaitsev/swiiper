@@ -2,14 +2,14 @@ import base64
 import json
 from html import escape
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import httpx
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from app import main, names, proxy, worker
+from app import main, names, proxy, webapi, worker
 
 
 def row(number):
@@ -190,9 +190,9 @@ def sent_login(entry):
     return base64.b64decode(encoded).decode().split(':', 1)
 
 
-def test_oxylabs_requires_proxy_user_not_web_api_key(oxy_env):
+def test_missing_credentials_names_both_options(oxy_env):
     oxy_env.delenv('OXYLABS_PROXY_PASSWORD')
-    with pytest.raises(ValueError, match='not the Web API key'):
+    with pytest.raises(ValueError, match='OXYLABS_WEB_API_KEY.*OXYLABS_PROXY_USERNAME'):
         proxy.load_proxy()
 
 
@@ -504,3 +504,106 @@ async def test_ui_files_are_revalidated(client):
             response = await client.get(path)
             assert response.status_code == 200 and response.headers['cache-control'] == 'no-cache'
         assert 'cache-control' not in (await client.get('/healthz')).headers
+
+
+WEB_API_REPLY = {'state': 'done', 'results': [{
+    'html': ATOM.decode(), 'metadata': {'statuses': {'http_request': {'code': 200, 'tag': 'HTTP_OK'}}}}]}
+
+
+async def fake_web_api(status, payload):
+    """A local stand-in for webapi.oxylabs.io that records the request it receives."""
+    import asyncio
+    seen = {}
+
+    async def reply(reader, writer):
+        lines = (await reader.readuntil(b'\r\n\r\n')).decode().split('\r\n')
+        header = {line.split(':', 1)[0].lower(): line.split(':', 1)[1].strip() for line in lines[1:] if ':' in line}
+        seen['auth'] = header.get('authorization')
+        seen['body'] = json.loads(await reader.readexactly(int(header['content-length'])))
+        body = json.dumps(payload).encode()
+        writer.write(f'HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n'
+                     f'Content-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode() + body)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(reply, '127.0.0.1', 0)
+    api = webapi.WebApi('k' * 20, endpoint=f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/scrape')
+    return server, api, seen
+
+
+@pytest.mark.asyncio
+async def test_web_api_fetches_the_feed_with_the_key():
+    server, api, seen = await fake_web_api(200, WEB_API_REPLY)
+    async with server, worker.session_factory() as session:
+        body, _ = await worker.fetch_once(session, 'https://www.reddit.com/r/pics/.rss', api)
+    assert seen['auth'] == 'Bearer ' + 'k' * 20
+    assert seen['body'] == {'url': 'https://www.reddit.com/r/pics/.rss', 'output': ['html']}
+    assert len(worker.parse_posts(body, 'pics')) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status,payload,expected', [
+    (200, {'results': [{'html': 'x', 'metadata': {'statuses': {'http_request': {'code': 404}}}}]},
+     ('http_response', 404, False, False)),
+    (200, {'results': [{'html': '', 'metadata': {}}]}, ('webapi_empty', None, False, False)),
+    (401, {'title': 'Unauthorized'}, ('webapi_auth', 401, False, True)),
+    (429, {'title': 'QUOTA_EXCEEDED'}, ('webapi_quota', 429, False, True)),
+    (429, {'title': 'TOO_MANY_REQUESTS'}, ('webapi_rate_limit', 429, True, True)),
+    (500, {'state': 'faulted', 'title': 'REQUEST_FAILED_AFTER_TOO_MANY_RETRIES'},
+     ('webapi_faulted', 500, True, False)),
+    (400, {'errors': []}, ('webapi_request', 400, False, False)),
+])
+async def test_web_api_failures(status, payload, expected):
+    server, api, _ = await fake_web_api(status, payload)
+    async with server, worker.session_factory() as session:
+        with pytest.raises(worker.FetchFailure) as caught:
+            await worker.fetch_once(session, 'https://www.reddit.com/r/pics/.rss', api)
+    failure = caught.value
+    assert (failure.stage, failure.status, failure.retryable, worker.stops_worker(failure)) == expected
+    assert 'k' * 20 not in str(failure)
+
+
+def test_web_api_key_from_environment(monkeypatch):
+    monkeypatch.delenv('OXYLABS_WEB_API_KEY', raising=False)
+    assert webapi.load_web_api() is None
+    monkeypatch.setenv('OXYLABS_WEB_API_KEY', ' abcDEF123456789xyz0 ')
+    api = webapi.load_web_api()
+    assert api.key == 'abcDEF123456789xyz0' and 'abcDEF' not in repr(api)
+    monkeypatch.setenv('OXYLABS_WEB_API_KEY', 'not a key, has spaces')
+    with pytest.raises(ValueError) as caught:
+        webapi.load_web_api()
+    assert 'spaces' not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_web_api_diagnose_is_one_request(monkeypatch, capsys):
+    fetch = AsyncMock(return_value=(ATOM, ''))
+    monkeypatch.setattr(worker, 'fetch_once', fetch)
+    assert await worker.diagnose(None, webapi.WebApi('k' * 20), 'pics') == 0
+    assert [call.args[1] for call in fetch.await_args_list] == ['https://www.reddit.com/r/pics/.rss']
+    assert json.loads(capsys.readouterr().out)['posts'] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route,media_route', [
+    (webapi.WebApi('k' * 20), None),  # billed per request, so playlists go direct
+    (proxy.ProxyEntry(url='http://127.0.0.1:9'), proxy.ProxyEntry(url='http://127.0.0.1:9')),
+])
+async def test_video_playlist_checks_and_route(monkeypatch, route, media_route):
+    feed = reddit_feed(reddit_entry('vid', 'https://external-preview.redd.it/V.png?width=640&s=v',
+                                    'https://v.redd.it/vid123'))
+    monkeypatch.setattr(worker, 'fetch_with_retries', AsyncMock(return_value=(feed, '')))
+    fetch = AsyncMock(return_value=(b'#EXTM3U\n', ''))
+    monkeypatch.setattr(worker, 'fetch_once', fetch)
+    conn = MagicMock(executemany=AsyncMock())
+    pool = MagicMock(fetch=AsyncMock(return_value=[]))
+    pool.acquire.return_value.__aenter__.return_value = conn
+
+    async def no_keys(**_):
+        for key in ():
+            yield key
+
+    assert await worker.ingest(None, route, pool, MagicMock(scan_iter=no_keys), 'pics') == 1
+    assert fetch.await_args.args[1:] == ('https://v.redd.it/vid123/HLSPlaylist.m3u8', media_route)
+    assert conn.executemany.await_args.args[1][0][3:5] == ('video_hls', 'https://v.redd.it/vid123/HLSPlaylist.m3u8')

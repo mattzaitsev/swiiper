@@ -1,4 +1,4 @@
-"""Outbound proxy for the worker: Oxylabs.
+"""Oxylabs proxy for the worker, used when no Web API key is set (see app/webapi.py).
 
 Products and entry points (Oxylabs docs, "Quick Start: Proxies"):
 
@@ -114,8 +114,8 @@ def load_proxy() -> ProxyEntry:
 
     username, password = _credentials()
     if not username or not password:
-        raise ValueError('Set OXYLABS_PROXY_USERNAME and OXYLABS_PROXY_PASSWORD '
-                         '(the proxy user from the Oxylabs dashboard, not the Web API key)')
+        raise ValueError('Set OXYLABS_WEB_API_KEY (your Oxylabs Web API key), or OXYLABS_PROXY_USERNAME '
+                         'and OXYLABS_PROXY_PASSWORD for an Oxylabs proxy user')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', username):
         raise ValueError('OXYLABS_PROXY_USERNAME may contain only letters, digits, _ . and -')
 

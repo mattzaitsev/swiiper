@@ -1,4 +1,4 @@
-"""RSS ingestion through the Oxylabs proxy, plus a one-request-per-stage proxy diagnostic.
+"""RSS ingestion through Oxylabs (Web API or proxy), plus a one-request-per-stage diagnostic.
 
 No TLS impersonation, disabled certificate checks, or identity changes in response to a denial.
 """
@@ -26,13 +26,17 @@ from redis.exceptions import RedisError
 from .db import open_pool
 from .names import normalize_feed
 from .proxy import IP_CHECK_URLS, ProxyEntry, load_proxy
+from .webapi import WebApi, load_web_api
 
 log = logging.getLogger('swiiper.worker')
 TRANSIENT = {429, 500, 502, 503, 504}
 # Stop the whole worker on proxy auth failure (407) or throttling that survived retries (429).
 # Never switch sessions or credentials to get past a denial or a Retry-After.
 STOP_STATUSES = {407, 429}
+# Also stop on a rejected Web API key or a spent Web API quota.
+STOP_STAGES = {'webapi_auth', 'webapi_quota'}
 MAX_BODY = 4 * 1024 * 1024
+MAX_API_BODY = 8 * 1024 * 1024
 IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
 ORIGINAL_IMAGE_HOSTS = {'i.redd.it', 'i.imgur.com'}
 PREVIEW_HOSTS = {'preview.redd.it', 'external-preview.redd.it'}
@@ -52,6 +56,10 @@ class FetchFailure(Exception):
     def __str__(self):
         # Never serialize aiohttp exceptions: their request info can contain credentials.
         return f'stage={self.stage} status={self.status}'
+
+
+def stops_worker(exc: FetchFailure) -> bool:
+    return exc.status in STOP_STATUSES or exc.stage in STOP_STAGES
 
 
 def retry_delay(value: str | None) -> float | None:
@@ -81,22 +89,29 @@ def session_factory():
                  'Accept': 'application/atom+xml, application/rss+xml, application/xml;q=0.9, */*;q=0.1'})
 
 
-async def fetch_once(session, url, proxy: ProxyEntry | None):
+async def read_body(response, limit):
+    chunks, size = [], 0
+    async for chunk in response.content.iter_chunked(65536):
+        size += len(chunk)
+        if size > limit:
+            raise FetchFailure('body_too_large')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
+async def fetch_once(session, url, route: ProxyEntry | WebApi | None):
+    """One GET of `url`: through the Web API, through a proxy, or directly when route is None."""
+    if isinstance(route, WebApi):
+        return await fetch_via_web_api(session, url, route)
     try:
-        async with session.get(url, proxy=proxy.url if proxy else None,
-                               proxy_headers=proxy.headers if proxy else None,
+        async with session.get(url, proxy=route.url if route else None,
+                               proxy_headers=route.headers if route else None,
                                allow_redirects=False) as response:
             if response.status != 200:
                 raise FetchFailure('http_response', response.status,
                                    response.status in TRANSIENT,
                                    retry_delay(response.headers.get('Retry-After')))
-            chunks, size = [], 0
-            async for chunk in response.content.iter_chunked(65536):
-                size += len(chunk)
-                if size > MAX_BODY:
-                    raise FetchFailure('body_too_large')
-                chunks.append(chunk)
-            return b''.join(chunks), response.headers.get('Content-Type', '')
+            return await read_body(response, MAX_BODY), response.headers.get('Content-Type', '')
     except aiohttp.ClientHttpProxyError as exc:
         raise FetchFailure('proxy_connect', exc.status, exc.status in TRANSIENT,
                            retry_delay((exc.headers or {}).get('Retry-After'))) from None
@@ -112,10 +127,53 @@ async def fetch_once(session, url, proxy: ProxyEntry | None):
         raise FetchFailure('http_client') from None
 
 
-async def fetch_with_retries(session, url, proxy, attempts=3):
+async def fetch_via_web_api(session, url, api: WebApi):
+    """Have Oxylabs fetch `url` (POST /v1/scrape) and return the body Reddit served."""
+    try:
+        async with session.post(api.endpoint, json={'url': url, 'output': ['html']},
+                                headers={'Authorization': f'Bearer {api.key}'},
+                                timeout=aiohttp.ClientTimeout(total=150, connect=20, sock_read=140),
+                                allow_redirects=False) as response:
+            raw = await read_body(response, MAX_API_BODY)
+            status, retry_after = response.status, retry_delay(response.headers.get('Retry-After'))
+    except asyncio.TimeoutError:
+        raise FetchFailure('timeout', retryable=True) from None
+    except aiohttp.ClientConnectionError:
+        raise FetchFailure('connection', retryable=True) from None
+    except aiohttp.ClientError:
+        raise FetchFailure('http_client') from None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    data = data if isinstance(data, dict) else {}
+    if status == 401:
+        raise FetchFailure('webapi_auth', 401)
+    if status == 429:
+        if data.get('title') == 'QUOTA_EXCEEDED':
+            raise FetchFailure('webapi_quota', 429)
+        raise FetchFailure('webapi_rate_limit', 429, True, retry_after)
+    if status >= 500:
+        # A faulted request is not charged, so retrying it costs nothing.
+        raise FetchFailure('webapi_faulted', status, True, retry_after)
+    if status != 200:
+        raise FetchFailure('webapi_request', status)
+    results = data.get('results')
+    result = results[0] if isinstance(results, list) and results and isinstance(results[0], dict) else {}
+    target = ((result.get('metadata') or {}).get('statuses') or {}).get('http_request') or {}
+    code = target.get('code')
+    if isinstance(code, int) and code != 200:
+        raise FetchFailure('http_response', code, code in TRANSIENT)
+    page = result.get('html')
+    if not isinstance(page, str) or not page:
+        raise FetchFailure('webapi_empty')
+    return page.encode('utf-8'), ''
+
+
+async def fetch_with_retries(session, url, route, attempts=3):
     for attempt in range(attempts):
         try:
-            return await fetch_once(session, url, proxy)
+            return await fetch_once(session, url, route)
         except FetchFailure as exc:
             log.warning('Fetch failed %s attempt=%d/%d', exc, attempt + 1, attempts)
             if not exc.retryable or attempt == attempts - 1:
@@ -280,20 +338,23 @@ def enrich_posts(posts, listing):
     return enriched
 
 
-async def ingest(session, proxy, pool, cache, subreddit):
-    body, _ = await fetch_with_retries(session, f'https://www.reddit.com/r/{subreddit}/.rss', proxy)
+async def ingest(session, route, pool, cache, subreddit):
+    body, _ = await fetch_with_retries(session, f'https://www.reddit.com/r/{subreddit}/.rss', route)
     posts = parse_posts(body, subreddit)
     # Optional for deployments with permitted JSON access. This sandbox's JSON
     # endpoint returns 403, so it is disabled rather than repeatedly retried.
     if os.getenv('REDDIT_JSON_ENRICHMENT', '0') == '1':
         try:
             metadata, _ = await fetch_once(session,
-                f'https://www.reddit.com/r/{subreddit}/.json?limit=25&raw_json=1', proxy)
+                f'https://www.reddit.com/r/{subreddit}/.json?limit=25&raw_json=1', route)
             posts = enrich_posts(posts, json.loads(metadata))
         except (FetchFailure, ValueError, KeyError, TypeError) as exc:
             log.warning('subreddit=%s video_metadata_unavailable type=%s', subreddit, type(exc).__name__)
     previous = await pool.fetch("SELECT db_primary_id, clean_delivery_url FROM reddit_media_posts WHERE subreddit=$1 AND media_category='video_hls'", subreddit)
     known = {row['db_primary_id']: row['clean_delivery_url'] for row in previous}
+    # Playlists come from Reddit's video CDN, which the browser loads directly when playing.
+    # Through the Web API each check would be a billed request, so those go direct.
+    media_route = None if isinstance(route, WebApi) else route
     resolved = []
     for post in posts:
         row = list(post)
@@ -303,12 +364,12 @@ async def ingest(session, proxy, pool, cache, subreddit):
                 row[3], row[4] = 'video_hls', manifest
             else:
                 try:
-                    manifest_body, _ = await fetch_once(session, manifest, proxy)
+                    manifest_body, _ = await fetch_once(session, manifest, media_route)
                     if manifest_body.lstrip().startswith(b'#EXTM3U'):
                         row[3], row[4] = 'video_hls', manifest
                 except FetchFailure as exc:
                     log.warning('subreddit=%s video_manifest_unavailable %s', subreddit, exc)
-                    if exc.status in STOP_STATUSES:
+                    if stops_worker(exc):
                         raise
         resolved.append(tuple(row))
     posts = resolved
@@ -342,11 +403,13 @@ async def upgrade_stored_images(pool):
     return len(changes)
 
 
-async def diagnose(session, proxy, subreddit):
+async def diagnose(session, route, subreddit):
+    # The exit-IP checks only apply to a proxy; the Web API check is the feed itself (one request).
+    checks = [] if isinstance(route, WebApi) else list(IP_CHECK_URLS)
     results = []
-    for name, url in IP_CHECK_URLS + [('reddit_feed', f'https://www.reddit.com/r/{subreddit}/.rss')]:
+    for name, url in checks + [('reddit_feed', f'https://www.reddit.com/r/{subreddit}/.rss')]:
         try:
-            body, content_type = await fetch_once(session, url, proxy)
+            body, content_type = await fetch_once(session, url, route)
             result = {'check': name, 'ok': True, 'status': 200,
                       'bytes': len(body), 'content_type': content_type}
             if name == 'reddit_feed':
@@ -381,14 +444,14 @@ async def run(args):
         finally:
             await pool.close()
         return 0
-    proxy = load_proxy()
-    log.info('Proxy: %s', proxy.label)
+    route = load_web_api() or load_proxy()
+    log.info('Fetching Reddit through: %s', route.label)
     subreddits = [normalize_feed(value) for value in os.getenv('SUBREDDITS', 'pics').split(',') if value.strip()]
     if not subreddits:
         raise ValueError('Set at least one SUBREDDITS entry')
     async with session_factory() as session:
         if args.diagnose:
-            return await diagnose(session, proxy, subreddits[0])
+            return await diagnose(session, route, subreddits[0])
         pool = await open_pool()
         cache = Redis.from_url(os.getenv('REDIS_URL', 'redis://redis:6379/0'),
                                socket_timeout=1, socket_connect_timeout=1)
@@ -411,7 +474,7 @@ async def run(args):
                     continue
                 for subreddit in targets:
                     try:
-                        count = await ingest(session, proxy, pool, cache, subreddit)
+                        count = await ingest(session, route, pool, cache, subreddit)
                         if job:
                             await pool.execute("UPDATE subreddit_requests SET status='ready', post_count=$2, message=NULL, updated_at=now() WHERE subreddit=$1", subreddit, count)
                     except FetchFailure as exc:
@@ -421,8 +484,8 @@ async def run(args):
                             message = ('This community is unavailable or restricted.' if exc.status in {401,403,404}
                                        else 'Could not load this community. Please try again later.')
                             await pool.execute("UPDATE subreddit_requests SET status='error', message=$2, updated_at=now() WHERE subreddit=$1", subreddit, message)
-                        # Stop globally on proxy auth failure or persistent throttling (STOP_STATUSES).
-                        if exc.status in STOP_STATUSES:
+                        # Stop globally on rejected credentials, a spent quota or persistent throttling.
+                        if stops_worker(exc):
                             return 1
                     await asyncio.sleep(2)
                 if args.once:
@@ -435,10 +498,10 @@ async def run(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument('--diagnose', action='store_true', help='Probe proxy stages without opening a database')
+    mode.add_argument('--diagnose', action='store_true', help='Check the Oxylabs connection without opening a database')
     mode.add_argument('--once', action='store_true', help='Ingest a single polling cycle')
     mode.add_argument('--upgrade-images', action='store_true',
-                      help='Point stored image posts at full-size originals (no proxy needed)')
+                      help='Point stored image posts at full-size originals (no network needed)')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     try:
         raise SystemExit(asyncio.run(run(parser.parse_args())))

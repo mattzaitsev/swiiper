@@ -30,9 +30,19 @@ internal Docker network, avoiding conflicts with other local projects.
 
 A fresh database starts empty. Starting the interface does not start the scraper.
 
-### Proxy: Oxylabs
+### Fetching Reddit: Oxylabs
 
-The worker fetches Reddit through an Oxylabs proxy. In `.env`, set the **proxy user** you created in the Oxylabs dashboard (Proxies → Users). The Web API key does not work here.
+The worker reaches Reddit through Oxylabs, with one of two credentials. It uses the first one it finds.
+
+**1. Web API key (default).** The key from the dashboard's Web API instance. Oxylabs fetches each feed (`POST https://webapi.oxylabs.io/v1/scrape`) and returns it as Reddit served it. If `OXYLABS_WEB_API_KEY` is already set in your environment (e.g. as a Windows user variable), there is nothing to configure: Compose passes it to the worker. Otherwise put it in `.env`:
+
+```env
+OXYLABS_WEB_API_KEY=your-web-api-key
+```
+
+Each feed fetch is one billed Web API request, roughly 3–8 seconds. With the defaults (3 communities every 300 seconds) that is 36 requests an hour, or 864 a day while the worker runs; raise `POLL_SECONDS` to use fewer. Video playlist checks go directly to Reddit's video CDN, which the browser loads anyway, so they cost nothing.
+
+**2. Proxy user (only without a Web API key).** For an Oxylabs proxy plan: in `.env`, set the **proxy user** you created in the dashboard (Proxies → Users).
 
 ```env
 OXYLABS_PROXY_USERNAME=your-proxy-user      # with or without the customer-/user- prefix
@@ -55,7 +65,7 @@ Optional settings:
 - `OXYLABS_PROXY_ENDPOINT`: a host:port override, e.g. a dedicated IP's port such as `ddc.oxylabs.io:8001`.
 - `OXYLABS_PROXY_CREDENTIALS_PATH`: keeps the credentials out of the environment. Point it at a Git-ignored `username:password` file; it's mounted as a Docker secret and takes priority over the two variables.
 
-Check the proxy before collecting posts. This runs one request per stage: the Oxylabs IP check over HTTP, then HTTPS, then the first subreddit's feed.
+Check the connection before collecting posts. With the Web API this is one request for the first subreddit's feed. With a proxy it runs one request per stage: the Oxylabs IP check over HTTP, then HTTPS, then the feed.
 
 ```powershell
 docker compose run --rm scraper_worker python -m app.worker --diagnose
@@ -71,9 +81,9 @@ docker compose logs --tail 30 api scraper_worker
 `SUBREDDITS` selects the initial feeds (`pics,aww,gaming` by default), and
 `POLL_SECONDS` controls the normal ingestion interval (300 seconds by default).
 Community refresh requests are processed by the worker between ingestion cycles.
-The worker uses bounded retries. It stops on proxy authentication failures (407) and on
-throttling that survives its retries (429), instead of switching sessions or credentials to
-get past a denial.
+The worker uses bounded retries. It stops on rejected credentials (a 401 Web API key or a
+407 proxy login), on a spent Web API quota, and on throttling that survives its retries (429),
+instead of switching sessions or credentials to get past a denial.
 
 Real credential files, `.env` files, downloaded media, and local database files are
 excluded from Git and from image builds. `oxylabs-proxy.example.txt` holds no credentials.
@@ -83,6 +93,7 @@ excluded from Git and from image builds. `oxylabs-proxy.example.txt` holds no cr
 ```text
 app/main.py          FastAPI routes, feeds, community status, local media delivery
 app/worker.py        RSS ingestion, media verification, queued community loads
+app/webapi.py        Oxylabs Web API settings (the default way to reach Reddit)
 app/proxy.py         Oxylabs proxy settings, username format and Proxy-Authorization
 app/names.py         Subreddit name rules and the 18+ check, shared by the API and worker
 app/db.py            Shared schema initialization and connection pool

@@ -36,3 +36,10 @@ Repository publication check, October 20, 2026: all 24 backend tests passed in a
 - Browser: the Home stream showed a 4000×2667 original; the community viewer showed a 3024×4032 original filling its stage instead of rendering at natural size; grid cards used 640 px previews. For you returned only SFW communities, an 18+ community returned the age gate, and dismissing the dialog kept 18+ communities hidden. Explore suggestions were served locally.
 - UI files are now sent with `Cache-Control: no-cache`. Without it, the browser kept using a stale stylesheet after the rebuild.
 - `node --check` passed on both frontend scripts; Docker Compose configuration validation passed.
+
+## Oxylabs Web API, October 20, 2026
+
+- The worker now reaches Reddit through the Oxylabs Web API (`POST /v1/scrape`, `output: ["html"]`) whenever `OXYLABS_WEB_API_KEY` is set, and falls back to the proxy configuration otherwise. The account in use has a Web API instance and no proxy user.
+- A Web API scrape of `https://www.reddit.com/r/pics/.rss` returned the Atom feed unchanged in `results[0].html`, with the target status in `results[0].metadata.statuses.http_request.code` (200), in about 7 seconds.
+- `python -m pytest -q`: **77 passed**. New tests use a local stand-in for the Web API and cover the Bearer header and request body, target status mapping, 401, quota and rate-limit 429s, faulted 500s, 400, empty results, key validation without echoing the value, the one-request diagnose, and video playlist checks going direct in Web API mode but through the proxy in proxy mode.
+- Live: `--diagnose` returned `reddit_feed ok, status 200, 25 posts`. Two `--once` cycles upserted a queued community (25) and then pics, aww and gaming (25 each). The newest post was 21 minutes old, and new image posts used `i.redd.it` originals with 640 px card previews.
